@@ -2,59 +2,74 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import { createServer as createViteServer } from 'vite';
-import Database from 'better-sqlite3';
+import initSqlJs from 'sql.js';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database('attendance.db');
 
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS students (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    admission_number TEXT UNIQUE NOT NULL
-  );
+async function startServer() {
+  const SQL = await initSqlJs();
+  let db;
+  try {
+    const filebuffer = fs.readFileSync('attendance.db');
+    db = new SQL.Database(filebuffer);
+  } catch {
+    db = new SQL.Database();
+  }
 
-  CREATE TABLE IF NOT EXISTS units (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    lecturer TEXT NOT NULL
-  );
+  // Save database on exit
+  process.on('exit', () => {
+    fs.writeFileSync('attendance.db', db.export());
+  });
 
-  CREATE TABLE IF NOT EXISTS lessons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    unit_id INTEGER,
-    date TEXT NOT NULL,
-    venue TEXT NOT NULL,
-    duration INTEGER,
-    start_time TEXT,
-    end_time TEXT,
-    scheduled_start TEXT,
-    scheduled_end TEXT,
-    lecturer_otp TEXT,
-    lecturer_present INTEGER DEFAULT 0,
-    otp_enabled INTEGER DEFAULT 0,
-    FOREIGN KEY(unit_id) REFERENCES units(id)
-  );
+  // Initialize Database
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS students (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      admission_number TEXT UNIQUE NOT NULL
+    );
 
-  CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  );
+    CREATE TABLE IF NOT EXISTS units (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      lecturer TEXT NOT NULL
+    );
 
-  CREATE TABLE IF NOT EXISTS attendance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    lesson_id INTEGER,
-    student_id INTEGER,
-    otp TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    marked_at TEXT,
-    FOREIGN KEY(lesson_id) REFERENCES lessons(id),
-    FOREIGN KEY(student_id) REFERENCES students(id)
-  );
-`);
+    CREATE TABLE IF NOT EXISTS lessons (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      unit_id INTEGER,
+      date TEXT NOT NULL,
+      venue TEXT NOT NULL,
+      duration INTEGER,
+      start_time TEXT,
+      end_time TEXT,
+      scheduled_start TEXT,
+      scheduled_end TEXT,
+      lecturer_otp TEXT,
+      lecturer_present INTEGER DEFAULT 0,
+      otp_enabled INTEGER DEFAULT 0,
+      FOREIGN KEY(unit_id) REFERENCES units(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS attendance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      lesson_id INTEGER,
+      student_id INTEGER,
+      otp TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      marked_at TEXT,
+      FOREIGN KEY(lesson_id) REFERENCES lessons(id),
+      FOREIGN KEY(student_id) REFERENCES students(id)
+    );
+  `);
 
 // Migration: Ensure lessons table has all columns (SQLite doesn't support ADD COLUMN IF NOT EXISTS easily)
 const columns = db.prepare("PRAGMA table_info(lessons)").all() as { name: string }[];
@@ -123,7 +138,7 @@ async function startServer() {
     const { name, admission_number } = req.body;
     try {
       const info = db.prepare('INSERT INTO students (name, admission_number) VALUES (?, ?)').run(name, admission_number);
-      const studentId = Number(info.lastInsertRowid);
+      const studentId = Number(info.insertId);
 
       // Check for an active lesson (within last 24 hours) to add this student to it
       const activeLesson = db.prepare(`
@@ -160,7 +175,7 @@ async function startServer() {
   app.post('/api/units', (req, res) => {
     const { name, lecturer } = req.body;
     const info = db.prepare('INSERT INTO units (name, lecturer) VALUES (?, ?)').run(name, lecturer);
-    res.json({ id: Number(info.lastInsertRowid) });
+    res.json({ id: Number(info.insertId) });
   });
 
   app.put('/api/students/:id', (req, res) => {
@@ -178,13 +193,14 @@ async function startServer() {
     const id = parseInt(req.params.id);
     console.log(`Attempting to delete student ID: ${id}`);
     try {
-      db.transaction(() => {
-        const attendanceDeleted = db.prepare('DELETE FROM attendance WHERE student_id = ?').run(id);
-        const studentDeleted = db.prepare('DELETE FROM students WHERE id = ?').run(id);
-        console.log(`Deleted ${attendanceDeleted.changes} attendance records and ${studentDeleted.changes} student record`);
-      })();
+      db.run('BEGIN');
+      const attendanceDeleted = db.prepare('DELETE FROM attendance WHERE student_id = ?').run(id);
+      const studentDeleted = db.prepare('DELETE FROM students WHERE id = ?').run(id);
+      db.run('COMMIT');
+      console.log(`Deleted ${attendanceDeleted.changes} attendance records and ${studentDeleted.changes} student record`);
       res.json({ success: true });
     } catch (e: any) {
+      db.run('ROLLBACK');
       console.error(`Error deleting student ${id}:`, e);
       res.status(500).json({ error: e.message || 'Failed to delete student' });
     }
@@ -205,18 +221,19 @@ async function startServer() {
     const id = parseInt(req.params.id);
     console.log(`Attempting to delete unit ID: ${id}`);
     try {
-      db.transaction(() => {
-        // Find all lessons for this unit
-        const lessons = db.prepare('SELECT id FROM lessons WHERE unit_id = ?').all() as { id: number }[];
-        console.log(`Found ${lessons.length} lessons for unit ${id}`);
-        for (const lesson of lessons) {
-          db.prepare('DELETE FROM attendance WHERE lesson_id = ?').run(lesson.id);
-        }
-        db.prepare('DELETE FROM lessons WHERE unit_id = ?').run(id);
-        db.prepare('DELETE FROM units WHERE id = ?').run(id);
-      })();
+      db.run('BEGIN');
+      // Find all lessons for this unit
+      const lessons = db.prepare('SELECT id FROM lessons WHERE unit_id = ?').all() as { id: number }[];
+      console.log(`Found ${lessons.length} lessons for unit ${id}`);
+      for (const lesson of lessons) {
+        db.prepare('DELETE FROM attendance WHERE lesson_id = ?').run(lesson.id);
+      }
+      db.prepare('DELETE FROM lessons WHERE unit_id = ?').run(id);
+      db.prepare('DELETE FROM units WHERE id = ?').run(id);
+      db.run('COMMIT');
       res.json({ success: true });
     } catch (e: any) {
+      db.run('ROLLBACK');
       console.error(`Error deleting unit ${id}:`, e);
       res.status(500).json({ error: e.message || 'Failed to delete unit' });
     }
@@ -266,7 +283,7 @@ async function startServer() {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(unitIdNum, start_time, venue, durationNum, start_time, end_time, scheduled_start, scheduled_end, lecturer_otp);
       
-      const lessonId = Number(lessonInfo.lastInsertRowid);
+      const lessonId = Number(lessonInfo.insertId);
       console.log('Lesson created with ID:', lessonId);
 
       const students = db.prepare('SELECT id FROM students').all() as { id: number }[];
@@ -274,12 +291,12 @@ async function startServer() {
       
       const insertAttendance = db.prepare('INSERT INTO attendance (lesson_id, student_id, otp) VALUES (?, ?, ?)');
       
-      db.transaction(() => {
-        for (const student of students) {
-          const otp = Math.floor(100000 + Math.random() * 900000).toString();
-          insertAttendance.run(lessonId, student.id, otp);
-        }
-      })();
+      db.run('BEGIN');
+      for (const student of students) {
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        insertAttendance.run(lessonId, student.id, otp);
+      }
+      db.run('COMMIT');
 
       io.emit('attendance-updated', { lessonId });
       res.json({ lessonId, success: true });
